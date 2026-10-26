@@ -17,3 +17,16 @@ pgdata/
 .env
 .env.*
 !.env.example
+
+# Terraform local configuration and state
+infra/terraform.tfvars
+infra/terraform.tfstate
+infra/terraform.tfstate.*
+infra/.terraform/
+
+# Personal Azure development environment
+infra-dev/terraform.tfvars
+infra-dev/terraform.tfstate
+infra-dev/terraform.tfstate.*
+infra-dev/.terraform/
+infra-dev/tfplan

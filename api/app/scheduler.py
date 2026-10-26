@@ -5,6 +5,7 @@ from sqlalchemy import select
 from shared.models import Domain, User, Scan, ScanStatus, ScanSchedule
 from shared.targets import normalize_domain, ownership_matches
 from shared.time_utils import database_utc
+from shared.monitoring import emit, configure_logging
 
 async def dispatch_one(db, domain_id, now):
     # Same lock order as owner API/manual scans. A retry rechecks the committed
@@ -31,6 +32,7 @@ async def dispatch_one(db, domain_id, now):
     try:
         authorized = await asyncio.wait_for(ownership_matches(name, domain.verification_token), timeout=10)
     except Exception:
+        emit('scheduler', 'scheduler_deferred')
         schedule.last_outcome = 'DNS unavailable; retry in 5 minutes'
         schedule.next_run_at = now + timedelta(minutes=5)
         await db.commit()
@@ -67,11 +69,18 @@ async def dispatch_due(sessions, now=None):
             await dispatch_one(db, domain_id, now)
 
 async def main():
+    configure_logging()
     from app.database import SessionLocal, engine
     try:
+        emit('scheduler', 'scheduler_started')
         await dispatch_due(SessionLocal)
+        emit('scheduler', 'scheduler_completed')
     finally:
         await engine.dispose()
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except Exception:
+        emit('scheduler', 'scheduler_failed')
+        raise SystemExit(1) from None

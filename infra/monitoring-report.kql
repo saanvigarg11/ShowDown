@@ -1,0 +1,18 @@
+// Run in the existing ShowDown workspace. Confirm app name for your environment.
+let events = ContainerAppConsoleLogs_CL
+| where TimeGenerated > ago(24h)
+| where ContainerAppName_s == "asm-core"
+| extend m=parse_json(Log_s)
+| where m.schema == "showdown.monitor.v1";
+// Completion events count attempts with committed terminal results; duration excludes queue wait.
+events
+| where m.event in ("scan_completed", "scan_failed")
+| summarize successes=countif(m.event == "scan_completed"), failures=countif(m.event == "scan_failed"), p95_seconds=percentile(todouble(m.duration_ms)/1000,95) by bin(TimeGenerated,1h)
+| order by TimeGenerated asc
+
+// Run separately: persisted rolling gauges survive worker restarts. Do NOT sum samples.
+// ContainerAppConsoleLogs_CL
+// | where TimeGenerated > ago(1h) and ContainerAppName_s == "asm-core"
+// | extend m=parse_json(Log_s)
+// | where m.schema == "showdown.monitor.v1" and m.event == "worker_health"
+// | project TimeGenerated, completed=toint(m.completed_count), failed=toint(m.failed_count), overdue=toint(m.overdue_schedules), notification_failures=toint(m.notification_failures), stuck=toint(m.notification_stuck), healthy=toint(m.healthy)

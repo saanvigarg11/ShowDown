@@ -1,7 +1,10 @@
 import asyncio
 import os
-import logging
 import uuid
+import time
+from contextlib import suppress
+from shared.monitoring import configure_logging, emit
+from worker.health import WorkerHealth
 from datetime import timedelta
 from shared.targets import normalize_domain, in_scope, public_addresses, ownership_matches
 from shared.time_utils import database_utc
@@ -10,7 +13,7 @@ from shared.auth_migration import require_auth_schema
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from sqlalchemy import select, or_, and_
 
-from worker.queue_client import get_next_job
+from worker.queue_client import get_next_job, client as queue_redis
 from worker.tasks.subdomain_enum import enumerate_subdomains
 from worker.tasks.port_scan import scan_hosts as port_scan_hosts
 from worker.tasks.socket_scan import scan_hosts as socket_scan_hosts
@@ -35,7 +38,7 @@ async def send_alert(message: str):
 
 SCAN_TIMEOUT = max(10, int(os.environ.get("SCAN_TIMEOUT_SECONDS", "900")))
 MAX_ATTEMPTS = 3
-log = logging.getLogger(__name__)
+health = WorkerHealth(SCAN_TIMEOUT + 120)
 
 async def run_pipeline(domain_name: str) -> dict:
     addresses, warnings = {}, []
@@ -69,10 +72,12 @@ async def run_pipeline(domain_name: str) -> dict:
                 resolved_addresses=addresses, warnings=warnings)
 
 async def process_job(job: dict):
+    health.progress()
+    started = time.monotonic()
     try:
         scan_id = uuid.UUID(str(job['scan_id']))
     except (KeyError, ValueError, TypeError):
-        log.warning("Discarded invalid queue job")
+        emit('worker', 'invalid_job')
         return
     async with SessionLocal() as db:
         # Row lock serializes duplicate deliveries; persisted lease permits crash recovery.
@@ -96,6 +101,7 @@ async def process_job(job: dict):
             scan.completed_at = now
             scan.diff = dict(metadata, error='Interrupted job retry limit exceeded')
             await db.commit()
+            emit('worker', 'scan_failed', attempt=attempts, duration_ms=(time.monotonic()-started)*1000)
             return
         domain = await db.get(Domain, scan.domain_id)
         owner = await db.get(User, domain.owner_id) if domain and domain.owner_id else None
@@ -104,6 +110,7 @@ async def process_job(job: dict):
             scan.completed_at = now
             scan.diff = {'error': 'Domain must have an active owner and DNS verification', 'attempts': attempts}
             await db.commit()
+            emit('worker', 'scan_failed', attempt=attempts, duration_ms=(time.monotonic()-started)*1000)
             return
         # Never trust domain names supplied by queue clients.
         domain_name = domain.name
@@ -111,6 +118,7 @@ async def process_job(job: dict):
         scan.status = ScanStatus.running
         scan.diff = {'attempts': attempts, 'lease_started': now.isoformat()}
         await db.commit()
+        emit('worker', 'scan_started', attempt=attempts)
         try:
             async with asyncio.timeout(SCAN_TIMEOUT):
                 domain_name = normalize_domain(domain_name)
@@ -150,6 +158,8 @@ async def process_job(job: dict):
                     db.add(ScanNotification(scan_id=scan.id, domain_id=domain.id,
                         owner_id=domain.owner_id, events=notification_events))
             await db.commit()
+            emit('worker', 'scan_completed', attempt=attempts, duration_ms=(time.monotonic()-started)*1000)
+            health.progress()
         except Exception as exc:
             await db.rollback()
             current = await db.execute(select(Scan).where(Scan.id == scan_id).with_for_update().execution_options(populate_existing=True))
@@ -160,13 +170,15 @@ async def process_job(job: dict):
             scan.completed_at = database_utc()
             scan.diff = {'error': str(exc) or type(exc).__name__, 'error_type': type(exc).__name__, 'attempts': attempts}
             await db.commit()
+            emit('worker', 'scan_failed', attempt=attempts, duration_ms=(time.monotonic()-started)*1000)
+            health.progress()
             return
         # Notification failure must never invalidate a committed scan.
         try:
             if SLACK_WEBHOOK_URL:
                 await deliver_pending(SessionLocal, send_alert)
         except Exception:
-            log.warning('Scan completed; notification failed')
+            emit('notifications', 'notification_failure')
 
 async def recover_pending():
     # PostgreSQL is the durable source of queued/running work. A Redis outage or
@@ -179,14 +191,27 @@ async def recover_pending():
         try:
             await process_job({'scan_id': str(scan_id)})
         except Exception:
-            log.exception('Pending job recovery failed; will retry')
+            emit('worker', 'worker_failure')
 
 async def main():
+    configure_logging()
     async with engine.connect() as connection:
         await connection.run_sync(require_auth_schema)
-    print('Worker started, polling for scan jobs...')
+    server = await asyncio.start_server(health.probe, '0.0.0.0', 8001, limit=1024)
+    monitor = asyncio.create_task(health.monitor(SessionLocal, queue_redis))
+    try:
+        await polling_loop()
+    finally:
+        monitor.cancel()
+        with suppress(asyncio.CancelledError):
+            await monitor
+        server.close()
+        await server.wait_closed()
+
+async def polling_loop():
     last_recovery = 0
     while True:
+        health.progress()
         try:
             if asyncio.get_running_loop().time() - last_recovery > 30:
                 await recover_pending()
@@ -197,8 +222,12 @@ async def main():
             if job:
                 await process_job(job)
         except Exception:
-            log.exception('Worker iteration failed; retrying after backoff')
+            emit('worker', 'worker_failure')
             await asyncio.sleep(5)
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except Exception:
+        emit('worker', 'startup_failed')
+        raise SystemExit(1) from None

@@ -7,6 +7,7 @@ import httpx
 from sqlalchemy import select
 from shared.models import Domain, User, ScanNotification
 from shared.time_utils import database_utc
+from shared.monitoring import emit
 from worker.tasks.diff_engine import build_alert_message
 from worker.tasks.risk_engine import canonical, score_snapshot
 
@@ -138,6 +139,7 @@ async def deliver_one(sessions, scan_id, sender, now=None):
         if item.status == 'sent':
             item.sent_at = now
         await db.commit()
+        emit('notifications', 'notification_result', state=item.status, attempt=item.attempts)
 
 async def deliver_pending(sessions, sender, now=None):
     now = database_utc(now)

@@ -155,6 +155,30 @@ resource "azurerm_container_app" "core" {
       cpu    = 0.25
       memory = "0.5Gi"
 
+      dynamic "liveness_probe" {
+        for_each = var.monitoring_enabled ? [1] : []
+        content {
+          transport = "HTTP"
+          port = 8000
+          path = "/health/live"
+          initial_delay = 30
+          interval_seconds = 30
+          timeout = 5
+          failure_count_threshold = 3
+        }
+      }
+      dynamic "readiness_probe" {
+        for_each = var.monitoring_enabled ? [1] : []
+        content {
+          transport = "HTTP"
+          port = 8000
+          path = "/health/ready"
+          interval_seconds = 30
+          timeout = 5
+          failure_count_threshold = 3
+        }
+      }
+
       env {
         name        = "DATABASE_URL"
         secret_name = "database-url"
@@ -178,7 +202,30 @@ resource "azurerm_container_app" "core" {
       image  = local.images.worker
       cpu    = 0.5
       memory = "1Gi"
-      # worker has no ports; it just polls Redis and writes to Postgres
+      # 8001 is only for internal health probes; no ingress route is added.
+      dynamic "liveness_probe" {
+        for_each = var.monitoring_enabled ? [1] : []
+        content {
+          transport = "HTTP"
+          port = 8001
+          path = "/health/live"
+          initial_delay = 30
+          interval_seconds = 30
+          timeout = 5
+          failure_count_threshold = 3
+        }
+      }
+      dynamic "readiness_probe" {
+        for_each = var.monitoring_enabled ? [1] : []
+        content {
+          transport = "HTTP"
+          port = 8001
+          path = "/health/ready"
+          interval_seconds = 30
+          timeout = 5
+          failure_count_threshold = 3
+        }
+      }
 
       env {
         name        = "DATABASE_URL"
